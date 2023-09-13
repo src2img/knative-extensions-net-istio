@@ -169,16 +169,24 @@ func makeVirtualServiceRoute(hosts sets.Set[string], http *v1alpha1.HTTPIngressP
 			}
 		}
 
-		weights = append(weights, &istiov1beta1.HTTPRouteDestination{
-			Destination: &istiov1beta1.Destination{
-				Host: network.GetServiceHostname(
-					split.ServiceName, split.ServiceNamespace),
-				Port: &istiov1beta1.PortSelector{
-					//nolint:gosec // ignore integer overflow
-					Number: uint32(split.ServicePort.IntValue()),
-				},
+		destination := &istiov1beta1.Destination{
+			Host: network.GetServiceHostname(
+				split.ServiceName, split.ServiceNamespace),
+			Port: &istiov1beta1.PortSelector{
+				//nolint:gosec // ignore integer overflow
+				Number: uint32(split.ServicePort.IntValue()),
 			},
+		}
 
+		if strings.HasSuffix(http.RewriteHost, ".function.cluster.local") {
+			destination.Host = "controller.codeengine-faas.svc.cluster.local"
+			destination.Port = &istiov1beta1.PortSelector{
+				Number: 8000,
+			}
+		}
+
+		weights = append(weights, &istiov1beta1.HTTPRouteDestination{
+			Destination: destination,
 			//nolint:gosec // ignore integer overflow - percent is always >0 & <100
 			Weight:  int32(split.Percent),
 			Headers: h,
