@@ -87,6 +87,8 @@ func newControllerWithOptions(
 	serviceInformer := serviceinformer.Get(ctx)
 	ingressInformer := ingressinformer.Get(ctx)
 
+	ingressLister := ingressInformer.Lister()
+
 	c := &Reconciler{
 		kubeclient:           kubeclient.Get(ctx),
 		istioClientSet:       istioclient.Get(ctx),
@@ -94,6 +96,7 @@ func newControllerWithOptions(
 		gatewayLister:        gatewayInformer.Lister(),
 		secretLister:         secretInformer.Lister(),
 		svcLister:            serviceInformer.Lister(),
+		ingressLister:        ingressLister,
 	}
 	myFilterFunc := reconciler.AnnotationFilterFunc(networking.IngressClassAnnotationKey, netconfig.IstioIngressClassName, true)
 
@@ -152,6 +155,45 @@ func newControllerWithOptions(
 			corev1.SchemeGroupVersion.WithKind("Secret"),
 		),
 	))
+
+	secretInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: func(obj interface{}) bool {
+			secret, ok := obj.(*corev1.Secret)
+			if !ok {
+				logger.Debugln("ignoring object because it cannot be casted to a Secret")
+				return false
+			}
+
+			return secret.Type == corev1.SecretTypeTLS
+		},
+		Handler: cache.ResourceEventHandlerFuncs{
+			// Add events are not relevant here.
+			// - The creation of a Secret is not relevant at all because it is then not referenced by a KIngress
+			// - At controller startup, the KIngresses are reconciled anyway, therefore no need to trigger a reconcile through the Secret.
+			// Delete events are not relevant here.
+			// - A Secret is prevented from deletion when a DomainMapping exists.
+
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				secret, ok := newObj.(*corev1.Secret)
+				if !ok {
+					logger.Debug("Ignoring update event because newObj cannot be casted to a Secret")
+					return
+				}
+
+				logger.Debugf("Checking whether KIngresses reference Secret %s/%s", secret.Namespace, secret.Name)
+
+				ingresses, err := FindKIngresses(ingressLister, secret)
+				if err != nil {
+					logger.Warnf("Failed to find ingresses: %v", err)
+				}
+
+				for _, ingress := range ingresses {
+					logger.Debugf("Scheduling reconcilation of KIngress %s/%s", ingress.Namespace, ingress.Name)
+					impl.Enqueue(ingress)
+				}
+			},
+		},
+	})
 
 	gatewayInformer.Informer().AddEventHandler(controller.HandleAll(
 		controller.EnsureTypeMeta(
