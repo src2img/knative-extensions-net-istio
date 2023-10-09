@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/google/go-cmp/cmp"
 	"go.uber.org/zap"
@@ -39,6 +40,7 @@ import (
 	"knative.dev/networking/pkg/apis/networking"
 	"knative.dev/networking/pkg/apis/networking/v1alpha1"
 	ingressreconciler "knative.dev/networking/pkg/client/injection/reconciler/networking/v1alpha1/ingress"
+	knnetlisters "knative.dev/networking/pkg/client/listers/networking/v1alpha1"
 	netconfig "knative.dev/networking/pkg/config"
 	"knative.dev/networking/pkg/status"
 	"knative.dev/pkg/controller"
@@ -64,11 +66,13 @@ const (
 type Reconciler struct {
 	kubeclient kubernetes.Interface
 
-	istioClientSet       istioclientset.Interface
-	virtualServiceLister istiolisters.VirtualServiceLister
-	gatewayLister        istiolisters.GatewayLister
-	secretLister         corev1listers.SecretLister
-	svcLister            corev1listers.ServiceLister
+	istioClientSet        istioclientset.Interface
+	virtualServiceLister  istiolisters.VirtualServiceLister
+	destinationRuleLister istiolisters.DestinationRuleLister
+	gatewayLister         istiolisters.GatewayLister
+	secretLister          corev1listers.SecretLister
+	svcLister             corev1listers.ServiceLister
+	ingressLister         knnetlisters.IngressLister
 
 	tracker tracker.Interface
 
@@ -91,7 +95,10 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ingress *v1alpha1.Ingres
 	reconcileErr := r.reconcileIngress(ctx, ingress)
 	if reconcileErr != nil {
 		logger.Errorw("Failed to reconcile Ingress: ", zap.Error(reconcileErr))
-		ingress.Status.MarkIngressNotReady(notReconciledReason, notReconciledMessage)
+		// prevent KIngress error on concurrency errors that will be retried
+		if !apierrs.IsConflict(reconcileErr) && !isUnableToAcquireLock(reconcileErr) {
+			ingress.Status.MarkIngressNotReady(notReconciledReason, notReconciledMessage)
+		}
 		return reconcileErr
 	}
 	return nil
@@ -124,7 +131,226 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 	}
 
 	externalIngressGateways := []*v1beta1.Gateway{}
-	if shouldReconcileExternalDomainTLS(ing) {
+
+	// Special handling for domain mappings
+	var dmDeleteGateways []*v1beta1.Gateway
+	var dmDeleteSecrets []*corev1.Secret
+	var dmModifiedGateways []*v1beta1.Gateway
+	if isOwnedByDomainMapping(ing) {
+		// a KIngress related to a domain mapping has exactly one secret
+		originSecrets, err := resources.GetSecrets(ing, v1alpha1.IngressVisibilityExternalIP, r.secretLister)
+		if err != nil {
+			return err
+		}
+
+		if len(originSecrets) != 1 {
+			return fmt.Errorf("expected exactly one Secret, but got %d", len(originSecrets))
+		}
+
+		var originSecret *corev1.Secret
+		for _, secret := range originSecrets {
+			originSecret = secret
+		}
+
+		certificateHash, err := resources.CalculateCertificateHash(originSecret)
+		if err != nil {
+			return err
+		}
+
+		gatewayList, err := resources.FindGatewaysByCertificateHash(r.gatewayLister, certificateHash)
+		if err != nil {
+			return err
+		}
+
+		if len(gatewayList) > 0 && resources.IsGatewayContainingHost(gatewayList[0], ing.Name) {
+			// gateway already covers host for this certificate no need to change anything
+			logger.Debugf("Gateway %s/%s is already up-to-date for KIngress %s/%s", config.IstioNamespace, gatewayList[0].Name, ing.Namespace, ing.Name)
+			externalIngressGateways = append(externalIngressGateways, gatewayList[0])
+		} else {
+			cancelFunc, err := lockCertificate(ctx, r.GetKubeClient(), certificateHash, ing)
+			if cancelFunc != nil {
+				defer cancelFunc()
+			}
+			if err != nil {
+				return err
+			}
+
+			// check if the secret mirror exists
+			_, err = r.secretLister.Secrets(config.IstioNamespace).Get(certificateHash)
+			if err != nil {
+				if !apierrs.IsNotFound(err) {
+					return err
+				}
+
+				// create the secret mirror
+				logger.Infof("Creating Secret %s/%s for KIngress %s/%s", config.IstioNamespace, certificateHash, ing.Namespace, ing.Name)
+				dmMirrorSecret := resources.MakeMirrorSecret(ctx, originSecret, certificateHash)
+				_, err = coreaccessor.ReconcileSecret(ctx, nil, dmMirrorSecret, r)
+				if err != nil {
+					return err
+				}
+			}
+
+			// check the Gateway
+			allGatewaysByHost, err := resources.FindGatewaysByHost(r.gatewayLister, ing.Name)
+			if err != nil {
+				return err
+			}
+
+			if len(allGatewaysByHost) == 0 {
+				// search by certificateHash
+				allGatewaysByCertificateHash, err := resources.FindGatewaysByCertificateHash(r.gatewayLister, certificateHash)
+				if err != nil {
+					return err
+				}
+
+				if len(allGatewaysByCertificateHash) == 0 {
+					// create the Gateway
+					dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+					if err != nil {
+						return err
+					}
+					logger.Infof("Creating new Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+
+					externalIngressGateways = append(externalIngressGateways, dmGateway)
+				} else if len(allGatewaysByCertificateHash) == 1 {
+					dmGateway := allGatewaysByCertificateHash[0]
+
+					// Gateway exists already, ensure the KIngress is covered
+					updatedGateway, updated, err := resources.EnsureGatewayCoversKIngress(dmGateway, ing)
+					if err != nil {
+						return err
+					}
+					if updated {
+						logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+						externalIngressGateways = append(externalIngressGateways, updatedGateway)
+						dmGateway = updatedGateway
+					} else {
+						logger.Debugf("Gateway %s/%s is already up-to-date for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+						externalIngressGateways = append(externalIngressGateways, dmGateway)
+					}
+				} else {
+					var gatewayNames []string
+					for _, gateway := range allGatewaysByCertificateHash {
+						gatewayNames = append(gatewayNames, gateway.Name)
+					}
+
+					return fmt.Errorf("found multiple Gateways (%s) for certificate hash %s", strings.Join(gatewayNames, ", "), certificateHash)
+				}
+			} else if len(allGatewaysByHost) == 1 {
+				// Gateway already exists, verify if it is for the desired certificate
+				if resources.IsGatewayForCertificate(allGatewaysByHost[0], certificateHash) {
+					dmGateway := allGatewaysByHost[0]
+					externalIngressGateways = append(externalIngressGateways, dmGateway)
+				} else {
+					// take leadership over the old certificate
+					oldCertificateHash, err := resources.GetCertificateHash(allGatewaysByHost[0])
+					if err != nil {
+						return err
+					}
+					cancelFunc, err := lockCertificate(ctx, r.GetKubeClient(), oldCertificateHash, ing)
+					if cancelFunc != nil {
+						defer cancelFunc()
+					}
+					if err != nil {
+						return err
+					}
+
+					canBeUpdated, err := resources.AreAllKIngressesReferencingCertificate(r.ingressLister, r.secretLister, allGatewaysByHost[0], certificateHash)
+					if err != nil {
+						return err
+					}
+
+					// search by certificateHash
+					allGatewaysByCertificateHash, err := resources.FindGatewaysByCertificateHash(r.gatewayLister, certificateHash)
+					if err != nil {
+						return err
+					}
+
+					if canBeUpdated && len(allGatewaysByCertificateHash) == 0 {
+						// we can modify the Gateway to be for the other certificate
+						dmGateway := resources.UpdateGatewayForNewCertificate(allGatewaysByHost[0], certificateHash)
+						logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+						externalIngressGateways = append(externalIngressGateways, dmGateway)
+
+						// and we can delete the previous Secret
+						oldSecret, err := r.secretLister.Secrets(config.IstioNamespace).Get(oldCertificateHash)
+						if err != nil && !apierrs.IsNotFound(err) {
+							return err
+						}
+
+						dmDeleteSecrets = append(dmDeleteSecrets, oldSecret)
+					} else {
+						if len(allGatewaysByCertificateHash) == 0 {
+							// create the Gateway
+							dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+							if err != nil {
+								return err
+							}
+							logger.Infof("Creating new Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+
+							externalIngressGateways = append(externalIngressGateways, dmGateway)
+						} else if len(allGatewaysByCertificateHash) == 1 {
+							dmGateway := allGatewaysByCertificateHash[0]
+
+							// Gateway exists already, ensure the KIngress is covered
+							updatedGateway, updated, err := resources.EnsureGatewayCoversKIngress(dmGateway, ing)
+							if err != nil {
+								return err
+							}
+							if updated {
+								logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+								dmGateway = updatedGateway
+							} else {
+								logger.Debugf("Gateway %s/%s is already up-to-date for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
+							}
+
+							externalIngressGateways = append(externalIngressGateways, dmGateway)
+						} else {
+							var gatewayNames []string
+							for _, gateway := range allGatewaysByCertificateHash {
+								gatewayNames = append(gatewayNames, gateway.Name)
+							}
+
+							return fmt.Errorf("found multiple Gateways (%s) for certificate hash %s", strings.Join(gatewayNames, ", "), certificateHash)
+						}
+
+						modifiedExistingGateway, deletionRequested, err := resources.RemoveKIngressFromGateway(allGatewaysByHost[0], ing)
+						if err != nil {
+							return err
+						}
+
+						if deletionRequested {
+							logger.Infof("Deleting Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, allGatewaysByHost[0].Name, ing.Namespace, ing.Name)
+							dmDeleteGateways = append(dmDeleteGateways, allGatewaysByHost[0])
+
+							// and we can delete the previous Secret
+							oldSecret, err := r.secretLister.Secrets(config.IstioNamespace).Get(oldCertificateHash)
+							if err != nil && !apierrs.IsNotFound(err) {
+								return err
+							}
+
+							dmDeleteSecrets = append(dmDeleteSecrets, oldSecret)
+						}
+
+						if modifiedExistingGateway != nil {
+							logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, modifiedExistingGateway.Name, ing.Namespace, ing.Name)
+							dmModifiedGateways = append(dmModifiedGateways, modifiedExistingGateway)
+						}
+					}
+				}
+			} else {
+				var gatewayNames []string
+				for _, gateway := range allGatewaysByHost {
+					gatewayNames = append(gatewayNames, gateway.Name)
+				}
+
+				return fmt.Errorf("found multiple gateways (%s) for host %s", strings.Join(gatewayNames, ", "), ing.Name)
+			}
+		}
+	}
+
+	if shouldReconcileExternalDomainTLS(ing) && !isOwnedByDomainMapping(ing) {
 		originSecrets, err := resources.GetSecrets(ing, v1alpha1.IngressVisibilityExternalIP, r.secretLister)
 		if err != nil {
 			return err
@@ -191,7 +417,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 		}
 	}
 
-	if shouldReconcileHTTPServer(ing) {
+	if shouldReconcileHTTPServer(ing) && !isOwnedByDomainMapping(ing) {
 		httpServer := resources.MakeHTTPServer(ing.Spec.HTTPOption, getPublicHosts(ing))
 		if len(externalIngressGateways) == 0 {
 			var err error
@@ -204,7 +430,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 				externalIngressGateways[i].Spec.Servers = append(externalIngressGateways[i].Spec.Servers, httpServer)
 			}
 		}
-	} else {
+	} else if !isOwnedByDomainMapping(ing) {
 		// Otherwise, we fall back to the default global Gateways for HTTP behavior.
 		// We need this for the backward compatibility.
 		defaultGlobalHTTPGateways := defaultGateways[v1alpha1.IngressVisibilityExternalIP]
@@ -233,6 +459,69 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 	if err := r.reconcileVirtualServices(ctx, ing, vses); err != nil {
 		ing.Status.MarkLoadBalancerFailed(virtualServiceNotReconciled, err.Error())
 		return err
+	}
+
+	if isOwnedByDomainMapping(ing) {
+		// in case of a secret change, the old Gateway must be deleted, or the host removed, we persist this now after the VirtualService was updated to point to the new Gateway
+		for _, gateway := range dmDeleteGateways {
+			logger.Infof("Deleting Gateway %s/%s for KIngress %s/%s", gateway.Namespace, gateway.Name, ing.Namespace, ing.Name)
+			if err = r.GetIstioClient().NetworkingV1beta1().Gateways(gateway.Namespace).Delete(ctx, gateway.Name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+				return fmt.Errorf("failed to delete Gateway %s/%s: %w", gateway.Namespace, gateway.Name, err)
+			}
+		}
+		for _, gateway := range dmModifiedGateways {
+			logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", gateway.Namespace, gateway.Name, ing.Namespace, ing.Name)
+			if _, err := r.GetIstioClient().NetworkingV1beta1().Gateways(gateway.Namespace).Update(ctx, gateway, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("failed to update Gateway %s/%s: %w", gateway.Namespace, gateway.Name, err)
+			}
+		}
+		for _, secret := range dmDeleteSecrets {
+			logger.Infof("Deleting Secret %s/%s for KIngress %s/%s", secret.Namespace, secret.Name, ing.Namespace, ing.Name)
+			if err = r.GetKubeClient().CoreV1().Secrets(secret.Namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+				return fmt.Errorf("failed to delete Secret %s/%s: %w", secret.Namespace, secret.Name, err)
+			}
+		}
+
+		if isCleanupOfOldGatewaysEnabled() {
+			// delete the old Gateways, determine their names by running the existing logic that would create them
+			originSecrets, err := resources.GetSecrets(ing, v1alpha1.IngressVisibilityExternalIP, r.secretLister)
+			if err != nil {
+				return err
+			}
+			nonWildcardSecrets, wildcardSecrets, err := resources.CategorizeSecrets(originSecrets)
+			if err != nil {
+				return err
+			}
+
+			nonWildcardIngressTLS := resources.GetNonWildcardIngressTLS(ing.Spec.TLS, nonWildcardSecrets)
+			allGateways, err := resources.MakeIngressTLSGateways(ctx, ing, v1alpha1.IngressVisibilityExternalIP, nonWildcardIngressTLS, nonWildcardSecrets, r.svcLister)
+			if err != nil {
+				return err
+			}
+
+			if shouldReconcileHTTPServer(ing) && len(allGateways) == 0 {
+				httpServer := resources.MakeHTTPServer(ing.Spec.HTTPOption, getPublicHosts(ing))
+				if allGateways, err = resources.MakeExternalIngressGateways(ctx, ing, []*istiov1beta1.Server{httpServer}, r.svcLister); err != nil {
+					return err
+				}
+			}
+
+			desiredWildcardGateways, err := resources.MakeWildcardTLSGateways(ctx, ing, wildcardSecrets, r.svcLister)
+			if err != nil {
+				return err
+			}
+			allGateways = append(allGateways, desiredWildcardGateways...)
+
+			for _, gateway := range allGateways {
+				gateway, err = r.gatewayLister.Gateways(gateway.Namespace).Get(gateway.Name)
+				if err == nil {
+					logger.Infof("Deleting Gateway %s/%s for KIngress %s/%s", gateway.Namespace, gateway.Name, ing.Namespace, ing.Name)
+					if err = r.GetIstioClient().NetworkingV1beta1().Gateways(gateway.Namespace).Delete(ctx, gateway.Name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+						return err
+					}
+				}
+			}
+		}
 	}
 
 	// Update status
@@ -327,9 +616,7 @@ func (r *Reconciler) reconcileSystemGeneratedGateway(ctx context.Context, desire
 	} else if err != nil {
 		return err
 	} else if !cmp.Equal(existing.Spec.DeepCopy(), desired.Spec.DeepCopy(), protocmp.Transform()) {
-		deepCopy := existing.DeepCopy()
-		deepCopy.Spec = *desired.Spec.DeepCopy()
-		if _, err := r.istioClientSet.NetworkingV1beta1().Gateways(desired.Namespace).Update(ctx, deepCopy, metav1.UpdateOptions{}); err != nil {
+		if _, err := r.istioClientSet.NetworkingV1beta1().Gateways(desired.Namespace).Update(ctx, desired, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
 	}
@@ -396,6 +683,70 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, ing *v1alpha1.Ingress) pk
 	for _, gws := range [][]config.Gateway{istiocfg.IngressGateways, istiocfg.LocalGateways} {
 		for _, gw := range gws {
 			if err := r.reconcileIngressServers(ctx, ing, gw, []*istiov1beta1.Server{}); err != nil {
+				return err
+			}
+		}
+	}
+
+	if isOwnedByDomainMapping(ing) {
+		// we need to delete the Gateways, we cannot look at the Secret to determine the certificate hash because the Secret may not anymore exist,
+		// we therefore must look at the annotations
+		allGateways, err := resources.FindGatewaysByKIngress(r.gatewayLister, ing)
+		if err != nil {
+			return err
+		}
+
+		for _, gateway := range allGateways {
+			// use a nested function so that defer works for the iteration
+			err = func() error {
+				certificateHash, err := resources.GetCertificateHash(gateway)
+				if err != nil {
+					return err
+				}
+
+				cancelFunc, err := lockCertificate(ctx, r.GetKubeClient(), certificateHash, ing)
+				if cancelFunc != nil {
+					defer cancelFunc()
+				}
+				if err != nil {
+					return err
+				}
+
+				modifiedGateway, deletionRequested, err := resources.RemoveKIngressFromGateway(gateway, ing)
+				if err != nil {
+					return err
+				}
+
+				if deletionRequested {
+					logger.Debugf("Deleting Gateway %s/%s for KIngress %s/%s", gateway.Namespace, gateway.Name, ing.Namespace, ing.Name)
+					if err = r.GetIstioClient().NetworkingV1beta1().Gateways(gateway.Namespace).Delete(ctx, gateway.Name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+						return fmt.Errorf("failed to delete Gateway: %w", err)
+					}
+
+					gatewaysByCertificateHash, err := resources.FindGatewaysByCertificateHash(r.gatewayLister, certificateHash)
+					if err != nil {
+						return err
+					}
+
+					if len(gatewaysByCertificateHash) == 0 {
+						logger.Debugf("Deleting Secret %s/%s for KIngress %s/%s", gateway.Namespace, certificateHash, ing.Namespace, ing.Name)
+						if err = r.GetKubeClient().CoreV1().Secrets(gateway.Namespace).Delete(ctx, certificateHash, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+							return fmt.Errorf("failed to delete Secret: %w", err)
+						}
+					}
+				}
+
+				if modifiedGateway != nil {
+					logger.Debugf("Updating Gateway %s/%s for KIngress %s/%s", gateway.Namespace, gateway.Name, ing.Namespace, ing.Name)
+					if err := r.reconcileSystemGeneratedGateway(ctx, modifiedGateway); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			}()
+
+			if err != nil {
 				return err
 			}
 		}
