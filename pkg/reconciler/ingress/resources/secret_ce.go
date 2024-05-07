@@ -33,7 +33,35 @@ func CalculateCertificateHash(secret *corev1.Secret) (string, error) {
 
 // MakeMirrorSecret creates a Secret object that mirrors a TLS Secret
 func MakeMirrorSecret(originSecret *corev1.Secret, certificateHash string) *corev1.Secret {
-	return makeSecret(originSecret, certificateHash, config.IstioNamespace, map[string]string{
+	secret := correctSecretFormat(originSecret)
+	return makeSecret(secret, certificateHash, config.IstioNamespace, map[string]string{
 		labelKeyDomainMappingSecret: labelValueDomainMappingSecret,
 	}, map[string]string{})
+}
+
+func decodeAndEncodePEMBlocks(data []byte) []byte {
+	var encodedData []byte
+	for len(data) > 0 {
+		block, rest := pem.Decode(data)
+		if block != nil {
+			encodedBlock := pem.EncodeToMemory(block)
+			encodedData = append(encodedData, encodedBlock...)
+		}
+		data = rest
+	}
+	return encodedData
+}
+
+func correctSecretFormat(originSecret *corev1.Secret) *corev1.Secret {
+	certificateData := originSecret.Data[corev1.TLSCertKey]
+	privateKeyData := originSecret.Data[corev1.TLSPrivateKeyKey]
+
+	encodedCertificate := decodeAndEncodePEMBlocks(certificateData)
+	encodedPrivateKey := decodeAndEncodePEMBlocks(privateKeyData)
+
+	secret := originSecret.DeepCopy()
+	secret.Data[corev1.TLSCertKey] = encodedCertificate
+	secret.Data[corev1.TLSPrivateKeyKey] = encodedPrivateKey
+
+	return secret
 }
