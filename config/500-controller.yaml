@@ -28,16 +28,12 @@ spec:
       app: net-istio-controller
   template:
     metadata:
-      annotations:
-        # This must be outside of the mesh to probe the gateways.
-        # NOTE: this is allowed here and not elsewhere because
-        # this is the Istio controller, and so it may be Istio-aware.
-        sidecar.istio.io/inject: "false"
       labels:
         app: net-istio-controller
         app.kubernetes.io/component: net-istio
         app.kubernetes.io/name: knative-serving
         app.kubernetes.io/version: devel
+        sidecar.istio.io/inject: "false"
     spec:
       serviceAccountName: controller
       containers:
