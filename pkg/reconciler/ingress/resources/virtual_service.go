@@ -133,15 +133,17 @@ func makeVirtualServiceSpec(ing *v1alpha1.Ingress, gateways map[v1alpha1.Ingress
 			p := rule.HTTP.Paths[i]
 			hosts := hosts.Intersection(sets.New(rule.Hosts...))
 			if hosts.Len() != 0 {
-				http := makeVirtualServiceRoute(hosts, &p, gateways, rule.Visibility)
-				// Add all the Gateways that exist inside the http.match section of
-				// the VirtualService.
-				// This ensures that we are only using the Gateways that actually appear
-				// in VirtualService routes.
-				for _, m := range http.Match {
-					gw = gw.Union(sets.New(m.Gateways...))
+				if _, ok := p.Headers["K-Network-Hash"]; ok {
+					http := makeVirtualServiceRoute(hosts, &p, gateways, rule.Visibility)
+					// Add all the Gateways that exist inside the http.match section of
+					// the VirtualService.
+					// This ensures that we are only using the Gateways that actually appear
+					// in VirtualService routes.
+					for _, m := range http.Match {
+						gw = gw.Union(sets.New(m.Gateways...))
+					}
+					spec.Http = append(spec.Http, http)
 				}
-				spec.Http = append(spec.Http, http)
 			}
 		}
 	}
@@ -270,12 +272,14 @@ func makeMatch(host, path string, headers map[string]v1alpha1.HeaderMatch, gatew
 	}
 
 	for k, v := range headers {
-		match.Headers = map[string]*istiov1beta1.StringMatch{
-			k: {
-				MatchType: &istiov1beta1.StringMatch_Exact{
-					Exact: v.Exact,
+		if k != "K-Network-Hash" {
+			match.Headers = map[string]*istiov1beta1.StringMatch{
+				k: {
+					MatchType: &istiov1beta1.StringMatch_Exact{
+						Exact: v.Exact,
+					},
 				},
-			},
+			}
 		}
 	}
 
