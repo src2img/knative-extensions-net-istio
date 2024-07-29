@@ -36,6 +36,11 @@ var (
 	defaultGateways         = makeGatewayMap([]string{"gateway"}, []string{"private-gateway"})
 	defaultIngressRuleValue = &v1alpha1.HTTPIngressRuleValue{
 		Paths: []v1alpha1.HTTPIngressPath{{
+			Headers: map[string]v1alpha1.HeaderMatch{
+				"K-Network-Hash": {
+					Exact: "K-Network-Hash-Value",
+				},
+			},
 			Splits: []v1alpha1.IngressBackendSplit{{
 				Percent: 100,
 				IngressBackend: v1alpha1.IngressBackend{
@@ -367,6 +372,11 @@ func TestMakeMeshVirtualServiceSpec_CorrectRoutes(t *testing.T) {
 				HTTP: &v1alpha1.HTTPIngressRuleValue{
 					Paths: []v1alpha1.HTTPIngressPath{{
 						Path: "/pets/",
+						Headers: map[string]v1alpha1.HeaderMatch{
+							"K-Network-Hash": {
+								Exact: "K-Network-Hash-Value",
+							},
+						},
 						Splits: []v1alpha1.IngressBackendSplit{{
 							IngressBackend: v1alpha1.IngressBackend{
 								ServiceNamespace: "test-ns",
@@ -475,6 +485,11 @@ func TestMakeIngressVirtualServiceSpec_CorrectRoutes(t *testing.T) {
 				HTTP: &v1alpha1.HTTPIngressRuleValue{
 					Paths: []v1alpha1.HTTPIngressPath{{
 						Path: "/pets/",
+						Headers: map[string]v1alpha1.HeaderMatch{
+							"K-Network-Hash": {
+								Exact: "K-Network-Hash-Value",
+							},
+						},
 						Splits: []v1alpha1.IngressBackendSplit{{
 							IngressBackend: v1alpha1.IngressBackend{
 								ServiceNamespace: "test-ns",
@@ -499,6 +514,11 @@ func TestMakeIngressVirtualServiceSpec_CorrectRoutes(t *testing.T) {
 				HTTP: &v1alpha1.HTTPIngressRuleValue{
 					Paths: []v1alpha1.HTTPIngressPath{{
 						Path: "/pets/",
+						Headers: map[string]v1alpha1.HeaderMatch{
+							"K-Network-Hash": {
+								Exact: "K-Network-Hash-Value",
+							},
+						},
 						Splits: []v1alpha1.IngressBackendSplit{{
 							IngressBackend: v1alpha1.IngressBackend{
 								ServiceNamespace: "test-ns",
