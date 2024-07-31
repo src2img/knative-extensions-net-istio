@@ -48,24 +48,22 @@ func InsertProbe(ing *v1alpha1.Ingress) (string, error) {
 	}
 	hash := fmt.Sprintf("%x", bytes)
 
-	for _, rule := range ing.Spec.Rules {
+	headerKey := header.HashKey
+	if len(ing.OwnerReferences) == 0 || ing.OwnerReferences[0].Kind == "DomainMapping" {
+		headerKey = header.PreferredHashKey
+	}
+
+	for i, rule := range ing.Spec.Rules {
 		if rule.HTTP == nil {
 			return "", fmt.Errorf("rule is missing HTTP block: %+v", rule)
 		}
-		probePaths := make([]v1alpha1.HTTPIngressPath, 0, len(rule.HTTP.Paths))
-		for i := range rule.HTTP.Paths {
-			elt := rule.HTTP.Paths[i].DeepCopy()
-			if elt.AppendHeaders == nil {
-				elt.AppendHeaders = make(map[string]string, 1)
+		for j := range rule.HTTP.Paths {
+			if ing.Spec.Rules[i].HTTP.Paths[j].AppendHeaders == nil {
+				ing.Spec.Rules[i].HTTP.Paths[j].AppendHeaders = make(map[string]string, 1)
 			}
-			if elt.Headers == nil {
-				elt.Headers = make(map[string]v1alpha1.HeaderMatch, 1)
-			}
-			elt.Headers[header.HashKey] = v1alpha1.HeaderMatch{Exact: header.HashValueOverride}
-			elt.AppendHeaders[header.HashKey] = hash
-			probePaths = append(probePaths, *elt)
+
+			ing.Spec.Rules[i].HTTP.Paths[j].AppendHeaders[headerKey] = hash
 		}
-		rule.HTTP.Paths = append(probePaths, rule.HTTP.Paths...)
 	}
 
 	return hash, nil

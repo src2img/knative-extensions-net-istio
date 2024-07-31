@@ -28,6 +28,7 @@ import (
 	"knative.dev/net-istio/pkg/reconciler/ingress/resources/names"
 	"knative.dev/networking/pkg/apis/networking"
 	"knative.dev/networking/pkg/apis/networking/v1alpha1"
+	"knative.dev/networking/pkg/http/header"
 	"knative.dev/networking/pkg/ingress"
 	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/network"
@@ -270,12 +271,14 @@ func makeMatch(host, path string, headers map[string]v1alpha1.HeaderMatch, gatew
 	}
 
 	for k, v := range headers {
-		match.Headers = map[string]*istiov1beta1.StringMatch{
-			k: {
-				MatchType: &istiov1beta1.StringMatch_Exact{
-					Exact: v.Exact,
+		if k != header.ProbeKey {
+			match.Headers = map[string]*istiov1beta1.StringMatch{
+				k: {
+					MatchType: &istiov1beta1.StringMatch_Exact{
+						Exact: v.Exact,
+					},
 				},
-			},
+			}
 		}
 	}
 
