@@ -388,7 +388,6 @@ func (m *Prober) processWorkItem() bool {
 		probeURL.String(),
 		prober.WithHeader(header.UserAgentKey, header.IngressReadinessUserAgent),
 		prober.WithHeader(header.ProbeKey, header.ProbeValue),
-		prober.WithHeader(header.HashKey, header.HashValueOverride),
 		m.probeVerifier(item))
 
 	// In case of cancellation, drop the work item
@@ -454,16 +453,23 @@ func (m *Prober) probeVerifier(item *workItem) prober.Verifier {
 		// actually is Ready than never marking it as Ready. It is best effort.
 		switch r.StatusCode {
 		case http.StatusOK:
+			preferedHash := r.Header.Get(header.PreferredHashKey)
 			hash := r.Header.Get(header.HashKey)
-			switch hash {
+
+			checkedHash := hash
+			if preferedHash != "" {
+				checkedHash = preferedHash
+			}
+
+			switch checkedHash {
 			case "":
-				item.logger.Errorf("Probing of %s abandoned, IP: %s:%s: the response doesn't contain the %q header",
-					item.url, item.podIP, item.podPort, header.HashKey)
+				item.logger.Errorf("Probing of %s abandoned, IP: %s:%s: the response doesn't contain the %q and %q header",
+					item.url, item.podIP, item.podPort, header.PreferredHashKey, header.HashKey)
 				return true, nil
 			case item.ingressState.hash:
 				return true, nil
 			default:
-				return false, fmt.Errorf("unexpected hash: want %q, got %q", item.ingressState.hash, hash)
+				return false, fmt.Errorf("unexpected hash: want %q, got preferred=%q and normal=%q", item.ingressState.hash, preferedHash, hash)
 			}
 
 		case http.StatusNotFound, http.StatusServiceUnavailable:
