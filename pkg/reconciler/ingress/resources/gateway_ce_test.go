@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"testing"
 
+	"istio.io/api/networking/v1alpha3"
 	istioapi "istio.io/api/networking/v1beta1"
 	istioclient "istio.io/client-go/pkg/apis/networking/v1beta1"
+	apimachinery "k8s.io/apimachinery/pkg/apis/meta/v1"
 	knnetapi "knative.dev/networking/pkg/apis/networking/v1alpha1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -290,7 +292,7 @@ func TestMakeGateway(t *testing.T) {
 
 	certificateHash := "2152137217362176376"
 
-	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress)
+	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress, istioapi.ServerTLSSettings_SIMPLE)
 
 	if err != nil {
 		t.Error("Got error", err)
@@ -328,6 +330,104 @@ func TestMakeGateway(t *testing.T) {
 				},
 				Tls: &istioapi.ServerTLSSettings{
 					Mode:           istioapi.ServerTLSSettings_SIMPLE,
+					CredentialName: certificateHash,
+				},
+			}, {
+				Hosts: []string{
+					"abc",
+				},
+				Port: &istioapi.Port{
+					Name:     "http",
+					Number:   80,
+					Protocol: "HTTP",
+				},
+				Tls: &istioapi.ServerTLSSettings{
+					HttpsRedirect: true,
+				},
+			}},
+		},
+	}
+
+	if diff := cmp.Diff(expectedGateway, returnedGateway, defaultGatewayCmpOpts); diff != "" {
+		t.Error("Unexpected Gateway (-want, +got):", diff)
+	}
+}
+
+func TestMakeMutualGateway(t *testing.T) {
+	serviceLister := &fakeServiceLister{
+		services: []*corev1.Service{{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: config.IstioNamespace,
+				Name:      "gateway",
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{
+					"gwt": "istio",
+				},
+			},
+		}},
+	}
+
+	kingress := &knnetapi.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "customer-namespace",
+			Name:      "abc",
+			Annotations: map[string]string{
+				"codeengine.cloud.ibm.com/tls-mode": "mutual",
+			},
+		},
+	}
+
+	ctx := config.ToContext(context.Background(), &config.Config{
+		Istio: &config.Istio{
+			IngressGateways: []config.Gateway{{
+				Name:       "gateway",
+				Namespace:  config.IstioNamespace,
+				ServiceURL: "gateway.istio-system.svc.cluster.local",
+			}},
+		},
+	})
+
+	certificateHash := "2152137217362176123"
+
+	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress, istioapi.ServerTLSSettings_MUTUAL)
+
+	if err != nil {
+		t.Error("Got error", err)
+		return
+	}
+
+	expectedGateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      returnedGateway.Name,
+			Namespace: config.IstioNamespace,
+			Annotations: map[string]string{
+				annotationKeyKIngresses: `[{"namespace":"customer-namespace","name":"abc"}]`,
+			},
+			Labels: map[string]string{
+				labelKeyDomainMappingGateway: labelValueDomainMappingGateway,
+				labelKeyCertificateHash:      certificateHash,
+			},
+		},
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: GatewayGroupVersionKind.GroupVersion().String(),
+			Kind:       GatewayGroupVersionKind.Kind,
+		},
+		Spec: istioapi.Gateway{
+			Selector: map[string]string{
+				"gwt": "istio",
+			},
+			Servers: []*istioapi.Server{{
+				Hosts: []string{
+					"abc",
+				},
+				Port: &istioapi.Port{
+					Name:     "https",
+					Number:   443,
+					Protocol: "HTTPS",
+				},
+				Tls: &istioapi.ServerTLSSettings{
+					Mode:           istioapi.ServerTLSSettings_MUTUAL,
 					CredentialName: certificateHash,
 				},
 			}, {
@@ -617,7 +717,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		secrets: []*corev1.Secret{secret1, secret2},
 	}
 
-	certificateHash, err := CalculateCertificateHash(secret1)
+	certificateHash, err := CalculateCertificateHash(context.Background(), secret1)
 	if err != nil {
 		t.Error("Got error", err)
 		return
@@ -675,7 +775,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		},
 	}
 
-	are, err := AreAllKIngressesReferencingCertificate(ingressLister, secretLister, gateway, certificateHash)
+	are, err := AreAllKIngressesReferencingCertificate(context.Background(), ingressLister, secretLister, gateway, certificateHash)
 	if err != nil {
 		t.Error("Got error", err)
 		return
@@ -704,7 +804,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		},
 	}
 
-	are, err = AreAllKIngressesReferencingCertificate(ingressLister, secretLister, gateway, certificateHash)
+	are, err = AreAllKIngressesReferencingCertificate(context.Background(), ingressLister, secretLister, gateway, certificateHash)
 	if err != nil {
 		t.Error("Got error", err)
 		return
@@ -745,4 +845,232 @@ func TestIsGatewayContainingHost(t *testing.T) {
 		t.Error("gateway contains host should be false")
 	}
 
+}
+
+func TestGetTlsModeIngress(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	mode, err := GetTlsMode(ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if mode != v1alpha3.ServerTLSSettings_MUTUAL {
+		t.Errorf("wrong TLS mode returned %v", mode)
+		return
+	}
+}
+
+func TestGetTlsModeSecret(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+		},
+	}
+	mode, err := GetTlsMode(ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if mode != v1alpha3.ServerTLSSettings_MUTUAL {
+		t.Errorf("wrong TLS mode returned %v", mode)
+		return
+	}
+}
+
+func TestGetTlsModeNoCA(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+		},
+	}
+	_, err := GetTlsMode(ingress, secret)
+	if err == nil {
+		t.Error("expected error, got none")
+		return
+	}
+}
+
+func TestEnsureTlsModeMutual(t *testing.T) {
+	gateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				labelKeyCertificateHash: "abc",
+			},
+		},
+		Spec: istioapi.Gateway{
+			Servers: []*istioapi.Server{{
+				Tls: &istioapi.ServerTLSSettings{
+					CredentialName: "abc",
+					Mode:           istioapi.ServerTLSSettings_SIMPLE,
+				},
+				Port: &v1alpha3.Port{Protocol: "HTTPS"},
+				Hosts: []string{
+					"testHost", "testHost2",
+				},
+			}},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	updatedGw, updated, err := EnsureTlsMode(gateway, ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if !updated {
+		t.Errorf("gateway not updated %v", updated)
+		return
+	}
+	if updatedGw.Spec.Servers[0].Tls.Mode != istioapi.ServerTLSSettings_MUTUAL {
+		t.Errorf("wrong TLS mode returned %v", updatedGw.Spec.Servers[0].Tls.Mode)
+		return
+	}
+}
+
+func TestEnsureTlsModeMutualDoesNotOverrideHttp(t *testing.T) {
+	gateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				labelKeyCertificateHash: "abc",
+			},
+		},
+		Spec: istioapi.Gateway{
+			Servers: []*istioapi.Server{{
+				Tls: &istioapi.ServerTLSSettings{
+					CredentialName: "abc",
+				},
+				Port: &v1alpha3.Port{Protocol: "HTTP"},
+				Hosts: []string{
+					"testHost", "testHost2",
+				},
+			}},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: apimachinery.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	_, updated, err := EnsureTlsMode(gateway, ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if updated {
+		t.Errorf("gateway updated %v", updated)
+		return
+	}
+}
+
+func TestIsTLsMode(t *testing.T) {
+	gateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				labelKeyCertificateHash: "abc",
+			},
+		},
+		Spec: istioapi.Gateway{
+			Servers: []*istioapi.Server{{
+				Tls: &istioapi.ServerTLSSettings{
+					CredentialName: "abc",
+					Mode:           istioapi.ServerTLSSettings_MUTUAL,
+				},
+				Port: &v1alpha3.Port{Protocol: "HTTPS"},
+				Hosts: []string{
+					"testHost", "testHost2",
+				},
+			}},
+		},
+	}
+	if !IsTlsMode(gateway, istioapi.ServerTLSSettings_MUTUAL) {
+		t.Error("gateway does not contain tls mode mutual")
+		return
+	}
+}
+
+func TestIsTLsModeWrong(t *testing.T) {
+	gateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				labelKeyCertificateHash: "abc",
+			},
+		},
+		Spec: istioapi.Gateway{
+			Servers: []*istioapi.Server{{
+				Tls: &istioapi.ServerTLSSettings{
+					CredentialName: "abc",
+					Mode:           istioapi.ServerTLSSettings_MUTUAL,
+				},
+				Port: &v1alpha3.Port{Protocol: "HTTPS"},
+				Hosts: []string{
+					"testHost", "testHost2",
+				},
+			}},
+		},
+	}
+	if IsTlsMode(gateway, istioapi.ServerTLSSettings_SIMPLE) {
+		t.Error("gateway contains tls mode simple")
+		return
+	}
 }

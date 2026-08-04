@@ -3,7 +3,9 @@ package resources
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -11,6 +13,7 @@ import (
 	istioclient "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istiolisters "istio.io/client-go/pkg/listers/networking/v1beta1"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
@@ -26,6 +29,9 @@ const (
 	labelKeyDomainMappingGateway   = "codeengine.cloud.ibm.com/domain-mapping-gateway"
 	labelValueDomainMappingGateway = "true"
 	labelKeyCertificateHash        = "codeengine.cloud.ibm.com/certificate-hash"
+	annotationTlsMode              = "codeengine.cloud.ibm.com/tls-mode"
+	tlsModeMutual                  = "mutual"
+	httpsProtocol                  = "HTTPS"
 )
 
 var (
@@ -141,7 +147,7 @@ func EnsureGatewayCoversKIngress(gateway *istioclient.Gateway, kingress *knnetap
 }
 
 // MakeGateway creates a Gateway object for a certificate hash and KIngress
-func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, certificateHash string, kingress *knnetapi.Ingress) (*istioclient.Gateway, error) {
+func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, certificateHash string, kingress *knnetapi.Ingress, tlsMode istioapi.ServerTLSSettings_TLSmode) (*istioclient.Gateway, error) {
 	gatewayServices, err := getGatewayServices(ctx, kingress, svcLister)
 	if err != nil {
 		return nil, err
@@ -190,7 +196,7 @@ func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, cer
 					Protocol: "HTTPS",
 				},
 				Tls: &istioapi.ServerTLSSettings{
-					Mode:           istioapi.ServerTLSSettings_SIMPLE,
+					Mode:           tlsMode,
 					CredentialName: certificateHash,
 				},
 			}, {
@@ -315,7 +321,7 @@ func extractSourceKIngresses(gateway *istioclient.Gateway) ([]namespacedName, er
 }
 
 // AreAllKIngressesReferencingCertificate checks if the KIngresses that are using a Gateway are all pointing to a Secret with a common certificateHash
-func AreAllKIngressesReferencingCertificate(ingressLister knnetlisters.IngressLister, secretLister corev1listers.SecretLister, gateway *istioclient.Gateway, certificateHash string) (bool, error) {
+func AreAllKIngressesReferencingCertificate(ctx context.Context, ingressLister knnetlisters.IngressLister, secretLister corev1listers.SecretLister, gateway *istioclient.Gateway, certificateHash string) (bool, error) {
 	kingressesNamespacedNames, err := extractSourceKIngresses(gateway)
 	if err != nil {
 		return false, err
@@ -337,7 +343,7 @@ func AreAllKIngressesReferencingCertificate(ingressLister knnetlisters.IngressLi
 			return false, err
 		}
 
-		secretCertificateHash, err := CalculateCertificateHash(secret)
+		secretCertificateHash, err := CalculateCertificateHash(ctx, secret)
 		if err != nil {
 			return false, err
 		}
@@ -357,4 +363,59 @@ func GetCertificateHash(gateway *istioclient.Gateway) (string, error) {
 		return "", fmt.Errorf("cannot read certificate hash from Gateway %s because label is missing", gateway.Name)
 	}
 	return certificateHash, nil
+}
+
+// EnsureTlsMode ensures the correct tls mode
+func EnsureTlsMode(gateway *istioclient.Gateway, ing *knnetapi.Ingress, secret *corev1.Secret) (*istioclient.Gateway, bool, error) {
+	modifiedGateway := gateway.DeepCopy()
+	updated := false
+
+	for i := range modifiedGateway.Spec.Servers {
+		if modifiedGateway.Spec.Servers[i].Tls != nil && modifiedGateway.Spec.Servers[i].Port.Protocol == httpsProtocol {
+			mode, err := GetTlsMode(ing, secret)
+			if err != nil {
+				return nil, false, err
+			}
+			if modifiedGateway.Spec.Servers[i].Tls.Mode != mode {
+				modifiedGateway.Spec.Servers[i].Tls.Mode = mode
+				updated = true
+			}
+		}
+	}
+	return modifiedGateway, updated, nil
+}
+
+// TODO: remove looking this up on the secret once UX support is there
+func GetTlsMode(ing *knnetapi.Ingress, secret *corev1.Secret) (istioapi.ServerTLSSettings_TLSmode, error) {
+	mode, found := ing.Annotations[annotationTlsMode]
+	if found && strings.ToLower(mode) == tlsModeMutual { // only mutual supported
+		var err error
+		if !containsCaCrt(secret) {
+			err = errors.New("secret contains no ca bundle")
+		}
+		return istioapi.ServerTLSSettings_MUTUAL, err
+	}
+	mode, found = secret.Annotations[annotationTlsMode]
+	if found && strings.ToLower(mode) == tlsModeMutual { // only mutual supported
+		var err error
+		if !containsCaCrt(secret) {
+			err = errors.New("secret contains no ca bundle")
+		}
+		return istioapi.ServerTLSSettings_MUTUAL, err
+	}
+	return istioapi.ServerTLSSettings_SIMPLE, nil
+}
+
+func containsCaCrt(secret *corev1.Secret) bool {
+	_, found := secret.Data[CaSecretKey]
+	return found
+}
+
+func IsTlsMode(gateway *istioclient.Gateway, mode istioapi.ServerTLSSettings_TLSmode) bool {
+	for i := range gateway.Spec.Servers {
+		if gateway.Spec.Servers[i].Tls != nil && gateway.Spec.Servers[i].Port.Protocol == httpsProtocol && gateway.Spec.Servers[i].Tls.Mode != mode {
+			return false
+		}
+	}
+	return true
 }
