@@ -159,7 +159,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 			originSecret = secret
 		}
 
-		certificateHash, err := resources.CalculateCertificateHash(originSecret)
+		certificateHash, err := resources.CalculateCertificateHash(ctx, originSecret)
 		if err != nil {
 			return err
 		}
@@ -169,7 +169,12 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 			return err
 		}
 
-		if len(gatewayList) > 0 && resources.IsGatewayContainingHost(gatewayList[0], ing.Name) {
+		tlsMode, err := resources.GetTlsMode(ing, originSecret)
+		if err != nil {
+			return err
+		}
+
+		if len(gatewayList) > 0 && resources.IsGatewayContainingHost(gatewayList[0], ing.Name) && resources.IsTlsMode(gatewayList[0], tlsMode) {
 			// gateway already covers host for this certificate no need to change anything
 			logger.Debugf("Gateway %s/%s is already up-to-date for KIngress %s/%s", config.IstioNamespace, gatewayList[0].Name, ing.Namespace, ing.Name)
 			externalIngressGateways = append(externalIngressGateways, gatewayList[0])
@@ -213,7 +218,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 
 				if len(allGatewaysByCertificateHash) == 0 {
 					// create the Gateway
-					dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+					dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing, tlsMode)
 					if err != nil {
 						return err
 					}
@@ -228,7 +233,11 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 					if err != nil {
 						return err
 					}
-					if updated {
+					updatedGateway, updatedTlsMode, err := resources.EnsureTlsMode(updatedGateway, ing, originSecret)
+					if err != nil {
+						return err
+					}
+					if updated || updatedTlsMode {
 						logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
 						externalIngressGateways = append(externalIngressGateways, updatedGateway)
 						dmGateway = updatedGateway
@@ -248,7 +257,11 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 				// Gateway already exists, verify if it is for the desired certificate
 				if resources.IsGatewayForCertificate(allGatewaysByHost[0], certificateHash) {
 					dmGateway := allGatewaysByHost[0]
-					externalIngressGateways = append(externalIngressGateways, dmGateway)
+					updatedGateway, _, err := resources.EnsureTlsMode(dmGateway, ing, originSecret)
+					if err != nil {
+						return err
+					}
+					externalIngressGateways = append(externalIngressGateways, updatedGateway)
 				} else {
 					// take leadership over the old certificate
 					oldCertificateHash, err := resources.GetCertificateHash(allGatewaysByHost[0])
@@ -263,7 +276,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 						return err
 					}
 
-					canBeUpdated, err := resources.AreAllKIngressesReferencingCertificate(r.ingressLister, r.secretLister, allGatewaysByHost[0], certificateHash)
+					canBeUpdated, err := resources.AreAllKIngressesReferencingCertificate(ctx, r.ingressLister, r.secretLister, allGatewaysByHost[0], certificateHash)
 					if err != nil {
 						return err
 					}
@@ -277,8 +290,12 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 					if canBeUpdated && len(allGatewaysByCertificateHash) == 0 {
 						// we can modify the Gateway to be for the other certificate
 						dmGateway := resources.UpdateGatewayForNewCertificate(allGatewaysByHost[0], certificateHash)
+						updatedGateway, _, err := resources.EnsureTlsMode(dmGateway, ing, originSecret)
+						if err != nil {
+							return err
+						}
 						logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
-						externalIngressGateways = append(externalIngressGateways, dmGateway)
+						externalIngressGateways = append(externalIngressGateways, updatedGateway)
 
 						// and we can delete the previous Secret
 						oldSecret, err := r.secretLister.Secrets(config.IstioNamespace).Get(oldCertificateHash)
@@ -290,7 +307,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 					} else {
 						if len(allGatewaysByCertificateHash) == 0 {
 							// create the Gateway
-							dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+							dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing, tlsMode)
 							if err != nil {
 								return err
 							}
@@ -305,7 +322,11 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 							if err != nil {
 								return err
 							}
-							if updated {
+							updatedGateway, updatedTlsMode, err := resources.EnsureTlsMode(updatedGateway, ing, originSecret)
+							if err != nil {
+								return err
+							}
+							if updated || updatedTlsMode {
 								logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, dmGateway.Name, ing.Namespace, ing.Name)
 								dmGateway = updatedGateway
 							} else {
@@ -341,8 +362,12 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 						}
 
 						if modifiedExistingGateway != nil {
+							updatedGateway, _, err := resources.EnsureTlsMode(modifiedExistingGateway, ing, originSecret)
+							if err != nil {
+								return err
+							}
 							logger.Infof("Updating Gateway %s/%s for KIngress %s/%s", config.IstioNamespace, modifiedExistingGateway.Name, ing.Namespace, ing.Name)
-							dmModifiedGateways = append(dmModifiedGateways, modifiedExistingGateway)
+							dmModifiedGateways = append(dmModifiedGateways, updatedGateway)
 						}
 					}
 				}

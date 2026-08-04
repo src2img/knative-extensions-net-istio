@@ -404,6 +404,7 @@ func (m *Prober) processWorkItem() bool {
 		ctx,
 		transport,
 		probeURL.String(),
+		isOwnedByDomainMapping(item),
 		prober.WithHeader(header.UserAgentKey, header.IngressReadinessUserAgent),
 		prober.WithHeader(header.ProbeKey, header.ProbeValue),
 		m.probeVerifier(item))
@@ -508,4 +509,16 @@ func deepCopy(in *url.URL) *url.URL {
 	// Safe to ignore the error since this is a deep copy
 	newURL, _ := url.Parse(in.String())
 	return newURL
+}
+
+func isOwnedByDomainMapping(item *workItem) bool {
+	if item == nil || item.ingressState == nil || item.ingressState.ing == nil {
+		return false
+	}
+	for _, owner := range item.ingressState.ing.OwnerReferences {
+		if owner.Kind == "DomainMapping" {
+			return true
+		}
+	}
+	return false
 }
