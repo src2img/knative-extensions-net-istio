@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +95,7 @@ func ExpectsStatusCodes(statusCodes []int) Verifier {
 
 // Do sends a single probe to given target, e.g. `http://revision.default.svc.cluster.local:81`.
 // Do returns whether the probe was successful or not, or there was an error probing.
-func Do(ctx context.Context, transport http.RoundTripper, target string, ops ...interface{}) (bool, error) {
+func Do(ctx context.Context, transport http.RoundTripper, target string, skipConnectError bool, ops ...interface{}) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return false, fmt.Errorf("%s is not a valid URL: %w", target, err)
@@ -106,6 +107,10 @@ func Do(ctx context.Context, transport http.RoundTripper, target string, ops ...
 	}
 
 	resp, err := transport.RoundTrip(req)
+	// accept required client certifcate as successful ingress configuration for domain mappings
+	if err != nil && strings.Contains(err.Error(), "tls: certificate required") && skipConnectError {
+		return true, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("error roundtripping %s: %w", target, err)
 	}
@@ -187,7 +192,7 @@ func (m *Manager) doAsync(ctx context.Context, target string, arg interface{}, p
 			inErr  error
 		)
 		err := wait.PollUntilContextTimeout(ctx, period, timeout, true, func(ctx context.Context) (bool, error) {
-			result, inErr = Do(ctx, m.transport, target, ops...)
+			result, inErr = Do(ctx, m.transport, target, false, ops...)
 			// Do not return error, which is from verifierError, as retry is expected until timeout.
 			return result, nil
 		})

@@ -290,7 +290,7 @@ func TestMakeGateway(t *testing.T) {
 
 	certificateHash := "2152137217362176376"
 
-	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress)
+	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress, istioapi.ServerTLSSettings_SIMPLE)
 
 	if err != nil {
 		t.Error("Got error", err)
@@ -328,6 +328,104 @@ func TestMakeGateway(t *testing.T) {
 				},
 				Tls: &istioapi.ServerTLSSettings{
 					Mode:           istioapi.ServerTLSSettings_SIMPLE,
+					CredentialName: certificateHash,
+				},
+			}, {
+				Hosts: []string{
+					"abc",
+				},
+				Port: &istioapi.Port{
+					Name:     "http",
+					Number:   80,
+					Protocol: "HTTP",
+				},
+				Tls: &istioapi.ServerTLSSettings{
+					HttpsRedirect: true,
+				},
+			}},
+		},
+	}
+
+	if diff := cmp.Diff(expectedGateway, returnedGateway, defaultGatewayCmpOpts); diff != "" {
+		t.Error("Unexpected Gateway (-want, +got):", diff)
+	}
+}
+
+func TestMakeMutualGateway(t *testing.T) {
+	serviceLister := &fakeServiceLister{
+		services: []*corev1.Service{{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: config.IstioNamespace,
+				Name:      "gateway",
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{
+					"gwt": "istio",
+				},
+			},
+		}},
+	}
+
+	kingress := &knnetapi.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "customer-namespace",
+			Name:      "abc",
+			Annotations: map[string]string{
+				"codeengine.cloud.ibm.com/tls-mode": "mutual",
+			},
+		},
+	}
+
+	ctx := config.ToContext(context.Background(), &config.Config{
+		Istio: &config.Istio{
+			IngressGateways: []config.Gateway{{
+				Name:       "gateway",
+				Namespace:  config.IstioNamespace,
+				ServiceURL: "gateway.istio-system.svc.cluster.local",
+			}},
+		},
+	})
+
+	certificateHash := "2152137217362176123"
+
+	returnedGateway, err := MakeGateway(ctx, serviceLister, certificateHash, kingress, istioapi.ServerTLSSettings_MUTUAL)
+
+	if err != nil {
+		t.Error("Got error", err)
+		return
+	}
+
+	expectedGateway := &istioclient.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      returnedGateway.Name,
+			Namespace: config.IstioNamespace,
+			Annotations: map[string]string{
+				annotationKeyKIngresses: `[{"namespace":"customer-namespace","name":"abc"}]`,
+			},
+			Labels: map[string]string{
+				labelKeyDomainMappingGateway: labelValueDomainMappingGateway,
+				labelKeyCertificateHash:      certificateHash,
+			},
+		},
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: GatewayGroupVersionKind.GroupVersion().String(),
+			Kind:       GatewayGroupVersionKind.Kind,
+		},
+		Spec: istioapi.Gateway{
+			Selector: map[string]string{
+				"gwt": "istio",
+			},
+			Servers: []*istioapi.Server{{
+				Hosts: []string{
+					"abc",
+				},
+				Port: &istioapi.Port{
+					Name:     "https",
+					Number:   443,
+					Protocol: "HTTPS",
+				},
+				Tls: &istioapi.ServerTLSSettings{
+					Mode:           istioapi.ServerTLSSettings_MUTUAL,
 					CredentialName: certificateHash,
 				},
 			}, {
@@ -617,7 +715,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		secrets: []*corev1.Secret{secret1, secret2},
 	}
 
-	certificateHash, err := CalculateCertificateHash(secret1)
+	certificateHash, err := CalculateCertificateHash(context.Background(), secret1)
 	if err != nil {
 		t.Error("Got error", err)
 		return
@@ -675,7 +773,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		},
 	}
 
-	are, err := AreAllKIngressesReferencingCertificate(ingressLister, secretLister, gateway, certificateHash)
+	are, err := AreAllKIngressesReferencingCertificate(context.Background(), ingressLister, secretLister, gateway, certificateHash)
 	if err != nil {
 		t.Error("Got error", err)
 		return
@@ -704,7 +802,7 @@ func TestAreAllKIngressesReferencingCertificate(t *testing.T) {
 		},
 	}
 
-	are, err = AreAllKIngressesReferencingCertificate(ingressLister, secretLister, gateway, certificateHash)
+	are, err = AreAllKIngressesReferencingCertificate(context.Background(), ingressLister, secretLister, gateway, certificateHash)
 	if err != nil {
 		t.Error("Got error", err)
 		return

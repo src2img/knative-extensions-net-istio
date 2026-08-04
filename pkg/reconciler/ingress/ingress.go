@@ -152,7 +152,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 			originSecret = secret
 		}
 
-		certificateHash, err := resources.CalculateCertificateHash(originSecret)
+		certificateHash, err := resources.CalculateCertificateHash(ctx, originSecret)
 		if err != nil {
 			return err
 		}
@@ -206,7 +206,11 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 
 				if len(allGatewaysByCertificateHash) == 0 {
 					// create the Gateway
-					dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+					mode, err := getTlsMode(ing, originSecret)
+					if err != nil {
+						return err
+					}
+					dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing, mode)
 					if err != nil {
 						return err
 					}
@@ -256,7 +260,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 						return err
 					}
 
-					canBeUpdated, err := resources.AreAllKIngressesReferencingCertificate(r.ingressLister, r.secretLister, allGatewaysByHost[0], certificateHash)
+					canBeUpdated, err := resources.AreAllKIngressesReferencingCertificate(ctx, r.ingressLister, r.secretLister, allGatewaysByHost[0], certificateHash)
 					if err != nil {
 						return err
 					}
@@ -283,7 +287,11 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 					} else {
 						if len(allGatewaysByCertificateHash) == 0 {
 							// create the Gateway
-							dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing)
+							mode, err := getTlsMode(ing, originSecret)
+							if err != nil {
+								return err
+							}
+							dmGateway, err := resources.MakeGateway(ctx, r.svcLister, certificateHash, ing, mode)
 							if err != nil {
 								return err
 							}
