@@ -2,11 +2,13 @@ package ingress
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	istiov1beta1 "istio.io/api/networking/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,10 +16,17 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"knative.dev/net-istio/pkg/reconciler/ingress/resources"
+	"knative.dev/networking/pkg/apis/networking/v1alpha1"
 	knnetapi "knative.dev/networking/pkg/apis/networking/v1alpha1"
 	knnetlisters "knative.dev/networking/pkg/client/listers/networking/v1alpha1"
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/system"
+)
+
+const (
+	annotationTlsMode = "codeengine.cloud.ibm.com/tls-mode"
+	tlsModeMutual     = "mutual"
 )
 
 // FindKIngresses looks for all KIngresses that are owned by a DomainMapping and reference a TLS Secret in the same namespace
@@ -130,4 +139,30 @@ func lockCertificate(ctx context.Context, client kubernetes.Interface, certifica
 
 func isUnableToAcquireLock(err error) bool {
 	return strings.HasPrefix(err.Error(), "unable to acquire lock")
+}
+
+func containsCaCrt(secret *corev1.Secret) bool {
+	_, found := secret.Data[resources.CaSecretKey]
+	return found
+}
+
+// TODO: remove looking this up on the secret once UX support is there
+func getTlsMode(ing *v1alpha1.Ingress, secret *corev1.Secret) (istiov1beta1.ServerTLSSettings_TLSmode, error) {
+	mode, found := ing.Annotations[annotationTlsMode]
+	if found && strings.ToLower(mode) == tlsModeMutual { // only mutual supported
+		var err error
+		if !containsCaCrt(secret) {
+			err = errors.New("secret contains no ca bundle")
+		}
+		return istiov1beta1.ServerTLSSettings_MUTUAL, err
+	}
+	mode, found = secret.Annotations[annotationTlsMode]
+	if found && strings.ToLower(mode) == tlsModeMutual { // only mutual supported
+		var err error
+		if !containsCaCrt(secret) {
+			err = errors.New("secret contains no ca bundle")
+		}
+		return istiov1beta1.ServerTLSSettings_MUTUAL, err
+	}
+	return istiov1beta1.ServerTLSSettings_SIMPLE, nil
 }

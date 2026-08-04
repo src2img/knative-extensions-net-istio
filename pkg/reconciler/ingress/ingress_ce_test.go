@@ -4,6 +4,7 @@ import (
 	"log"
 	"testing"
 
+	"istio.io/api/networking/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,6 +98,85 @@ func TestFindKIngresses(t *testing.T) {
 
 	if returnedIngress[0].ObjectMeta.Name != "ingress1" {
 		t.Errorf("wrong ingress returned %v", returnedIngress)
+		return
+	}
+}
+
+func TestGetTlsModeIngress(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	mode, err := getTlsMode(ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if mode != v1alpha3.ServerTLSSettings_MUTUAL {
+		t.Errorf("wrong TLS mode returned %v", mode)
+		return
+	}
+}
+
+func TestGetTlsModeSecret(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+		Data: map[string][]byte{"ca.crt": {}},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+		},
+	}
+	mode, err := getTlsMode(ingress, secret)
+	if err != nil {
+		t.Error("unexpected error", err)
+		return
+	}
+	if mode != v1alpha3.ServerTLSSettings_MUTUAL {
+		t.Errorf("wrong TLS mode returned %v", mode)
+		return
+	}
+}
+
+func TestGetTlsModeNoCA(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "abc",
+			Namespace: "default",
+			Annotations: map[string]string{
+				annotationTlsMode: tlsModeMutual,
+			},
+		},
+	}
+	ingress := &knnetapi.Ingress{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "ingress1",
+			Namespace: "default",
+		},
+	}
+	_, err := getTlsMode(ingress, secret)
+	if err == nil {
+		t.Error("expected error, got none")
 		return
 	}
 }

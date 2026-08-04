@@ -141,7 +141,7 @@ func EnsureGatewayCoversKIngress(gateway *istioclient.Gateway, kingress *knnetap
 }
 
 // MakeGateway creates a Gateway object for a certificate hash and KIngress
-func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, certificateHash string, kingress *knnetapi.Ingress) (*istioclient.Gateway, error) {
+func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, certificateHash string, kingress *knnetapi.Ingress, tlsMode istioapi.ServerTLSSettings_TLSmode) (*istioclient.Gateway, error) {
 	gatewayServices, err := getGatewayServices(ctx, kingress, svcLister)
 	if err != nil {
 		return nil, err
@@ -190,7 +190,7 @@ func MakeGateway(ctx context.Context, svcLister corev1listers.ServiceLister, cer
 					Protocol: "HTTPS",
 				},
 				Tls: &istioapi.ServerTLSSettings{
-					Mode:           istioapi.ServerTLSSettings_SIMPLE,
+					Mode:           tlsMode,
 					CredentialName: certificateHash,
 				},
 			}, {
@@ -315,7 +315,7 @@ func extractSourceKIngresses(gateway *istioclient.Gateway) ([]namespacedName, er
 }
 
 // AreAllKIngressesReferencingCertificate checks if the KIngresses that are using a Gateway are all pointing to a Secret with a common certificateHash
-func AreAllKIngressesReferencingCertificate(ingressLister knnetlisters.IngressLister, secretLister corev1listers.SecretLister, gateway *istioclient.Gateway, certificateHash string) (bool, error) {
+func AreAllKIngressesReferencingCertificate(ctx context.Context, ingressLister knnetlisters.IngressLister, secretLister corev1listers.SecretLister, gateway *istioclient.Gateway, certificateHash string) (bool, error) {
 	kingressesNamespacedNames, err := extractSourceKIngresses(gateway)
 	if err != nil {
 		return false, err
@@ -337,7 +337,7 @@ func AreAllKIngressesReferencingCertificate(ingressLister knnetlisters.IngressLi
 			return false, err
 		}
 
-		secretCertificateHash, err := CalculateCertificateHash(secret)
+		secretCertificateHash, err := CalculateCertificateHash(ctx, secret)
 		if err != nil {
 			return false, err
 		}
