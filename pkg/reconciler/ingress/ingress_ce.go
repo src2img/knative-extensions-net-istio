@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
@@ -16,9 +19,17 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	knnetapi "knative.dev/networking/pkg/apis/networking/v1alpha1"
 	knnetlisters "knative.dev/networking/pkg/client/listers/networking/v1alpha1"
+	knleaderelection "knative.dev/pkg/leaderelection"
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/system"
 )
+
+// inMemoryLocks holds per-certificate semaphores of weight 1 used when only one
+// reconciler process is running (Buckets == 1), avoiding the overhead of
+// Kubernetes Leases. A weighted semaphore is used instead of a sync.Mutex
+// because semaphore.Acquire accepts a context, giving us timeout and
+// cancellation support without extra goroutines or manual race handling.
+var inMemoryLocks sync.Map
 
 // FindKIngresses looks for all KIngresses that are owned by a DomainMapping and reference a TLS Secret in the same namespace
 func FindKIngresses(ingressLister knnetlisters.IngressLister, secret *corev1.Secret) ([]*knnetapi.Ingress, error) {
@@ -57,6 +68,28 @@ func isOwnedByDomainMapping(ing *knnetapi.Ingress) bool {
 
 func lockCertificate(ctx context.Context, client kubernetes.Interface, certificateHash string, ing *knnetapi.Ingress) (func(), error) {
 	logger := logging.FromContext(ctx)
+
+	leaderelectionConfig := knleaderelection.GetConfig(ctx)
+	if leaderelectionConfig.Buckets == uint32(1) {
+		// Optimization: only one process is reconciling, so a process-local
+		// lock is sufficient — no Kubernetes Lease required. A weighted
+		// semaphore of weight 1 is used instead of a sync.Mutex because
+		// semaphore.Acquire accepts a context, giving us timeout and
+		// cancellation support without extra goroutines or manual race handling.
+		sem, _ := inMemoryLocks.LoadOrStore(certificateHash, semaphore.NewWeighted(1))
+		s := sem.(*semaphore.Weighted)
+		logger.Debugf("Ingress %s/%s is attempting to acquire in-memory lock for %s", ing.Namespace, ing.Name, certificateHash)
+		lockCtx, cancelLock := context.WithTimeout(ctx, 2*time.Second)
+		defer cancelLock()
+		if err := s.Acquire(lockCtx, 1); err != nil {
+			return nil, fmt.Errorf("unable to acquire lock %s within 2s for %s/%s", certificateHash, ing.Namespace, ing.Name)
+		}
+		logger.Debugf("Ingress %s/%s acquired in-memory lock for %s", ing.Namespace, ing.Name, certificateHash)
+		return func() {
+			logger.Debugf("Ingress %s/%s releasing in-memory lock for %s", ing.Namespace, ing.Name, certificateHash)
+			s.Release(1)
+		}, nil
+	}
 
 	existingLease, err := client.CoordinationV1().Leases(system.Namespace()).Get(ctx, certificateHash, metav1.GetOptions{})
 	if err == nil && existingLease.Spec.HolderIdentity != nil && (existingLease.Spec.AcquireTime == nil || existingLease.Spec.AcquireTime.Time.Add(30*time.Second).Before(time.Now())) {
